@@ -1,0 +1,269 @@
+# OpenTelemetry Collector configuration
+#
+# Deployment model: TWO tiers
+#
+#   1. DaemonSet (this config) — runs on every node, collects from local pods.
+#      Keeps data local to the node; minimal network overhead.
+#
+#   2. Gateway Deployment — receives from DaemonSet agents; applies tail-based
+#      sampling for traces; routes to backends.
+#      See: otel-collector-gateway.yaml
+#
+# Key design decisions:
+#   - memory_limiter is first in every pipeline (prevents OOM)
+#   - batch processor groups telemetry for efficiency
+#   - k8sattributes enriches all signals with pod/namespace/node metadata
+#   - transform processors drop high-cardinality labels before Prometheus export
+
+receivers:
+  # OTLP: receives traces, metrics, logs from instrumented apps
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        max_recv_msg_size_mib: 8
+      http:
+        endpoint: 0.0.0.0:4318
+        cors:
+          allowed_origins: ["*"]
+
+  # Prometheus: scrapes kube-state-metrics, node-exporter, application metrics
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: kubernetes-pods
+          scrape_interval: 15s
+          kubernetes_sd_configs:
+            - role: pod
+          relabel_configs:
+            # Only scrape pods with prometheus.io/scrape: "true" annotation
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+              action: keep
+              regex: "true"
+            - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+              action: replace
+              target_label: __metrics_path__
+              regex: (.+)
+            - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+              action: replace
+              regex: ([^:]+)(?::\d+)?;(\d+)
+              replacement: $$1:$$2
+              target_label: __address__
+            - source_labels: [__meta_kubernetes_namespace]
+              target_label: namespace
+            - source_labels: [__meta_kubernetes_pod_name]
+              target_label: pod
+            - source_labels: [__meta_kubernetes_pod_label_app]
+              target_label: service
+          # Drop high-cardinality labels at scrape time
+          metric_relabel_configs:
+            - source_labels: [customer_id]
+              action: labeldrop
+            - source_labels: [campaign_id]
+              action: labeldrop
+            - source_labels: [device_id]
+              action: labeldrop
+
+        - job_name: node-exporter
+          scrape_interval: 30s
+          kubernetes_sd_configs:
+            - role: node
+          relabel_configs:
+            - action: labelmap
+              regex: __meta_kubernetes_node_label_(.+)
+
+  # Fluent Forward: receives logs from Fluent Bit
+  fluentforward:
+    endpoint: 0.0.0.0:24224
+
+  # Host metrics: CPU, memory, disk, network for the node
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk: {}
+      network: {}
+      filesystem:
+        exclude_mount_points:
+          mount_points: ["/dev/*", "/proc/*", "/sys/*"]
+          match_type: regexp
+
+processors:
+  # MUST be first in every pipeline — prevents OOM on traffic spikes
+  memory_limiter:
+    limit_mib: 512
+    spike_limit_mib: 128
+    check_interval: 5s
+
+  # Enrich all signals with Kubernetes metadata (namespace, pod, node, labels)
+  k8sattributes:
+    auth_type: serviceAccount
+    passthrough: false
+    extract:
+      metadata:
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.deployment.name
+        - k8s.namespace.name
+        - k8s.node.name
+        - k8s.pod.start_time
+      labels:
+        - tag_name: app
+          key: app
+          from: pod
+        - tag_name: version
+          key: version
+          from: pod
+    pod_association:
+      - sources:
+          - from: resource_attribute
+            name: k8s.pod.ip
+      - sources:
+          - from: connection
+
+  # Add resource attributes for all signals
+  resource:
+    attributes:
+      - action: insert
+        key: cluster
+        value: "${CLUSTER_NAME}"
+      - action: insert
+        key: region
+        value: "${AWS_REGION}"
+      - action: insert
+        key: environment
+        value: "${ENVIRONMENT}"
+
+  # Batch telemetry for efficient export
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Drop high-cardinality metric attributes before Prometheus export
+  transform/drop_high_cardinality:
+    metric_statements:
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "customer_id")
+          - delete_key(attributes, "campaign_id")
+          - delete_key(attributes, "device_id")
+          - delete_key(attributes, "request_id")
+          - delete_key(attributes, "trace_id")
+
+  # Filter: drop DEBUG logs in production, keep WARN+ and all ERROR
+  filter/log_severity:
+    logs:
+      exclude:
+        match_type: strict
+        severity_texts:
+          - DEBUG
+          - TRACE
+
+  # Add log-specific attributes for Loki label extraction
+  transform/log_labels:
+    log_statements:
+      - context: log
+        statements:
+          - set(attributes["loki.attribute.labels"], "namespace,service,level")
+
+exporters:
+  # Prometheus remote_write → Thanos Receiver
+  prometheusremotewrite:
+    endpoint: "http://thanos-receiver.monitoring.svc.cluster.local:19291/api/v1/receive"
+    tls:
+      insecure_skip_verify: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 120s
+    queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 5000
+    resource_to_telemetry_conversion:
+      enabled: true
+
+  # Loki for logs
+  loki:
+    endpoint: "http://loki-gateway.monitoring.svc.cluster.local/loki/api/v1/push"
+    tls:
+      insecure_skip_verify: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+    labels:
+      resource:
+        k8s.namespace.name: "namespace"
+        k8s.pod.name: "pod"
+        k8s.deployment.name: "service"
+        k8s.node.name: "node"
+      attributes:
+        level: "level"
+
+  # OTLP to Gateway collector (for tail-based trace sampling)
+  otlp/gateway:
+    endpoint: "otel-collector-gateway.monitoring.svc.cluster.local:4317"
+    tls:
+      insecure_skip_verify: false
+    retry_on_failure:
+      enabled: true
+
+  # Debug exporter (disabled in production, enabled via configmap override for troubleshooting)
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+extensions:
+  # Health check endpoint for Kubernetes liveness/readiness probes
+  health_check:
+    endpoint: 0.0.0.0:13133
+    path: /health/status
+
+  # pprof for performance profiling
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+  # zpages for live pipeline inspection
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+
+  pipelines:
+    # Metrics: collected from app endpoints + hostmetrics → Thanos
+    metrics:
+      receivers: [prometheus, hostmetrics, otlp]
+      processors: [memory_limiter, k8sattributes, resource, transform/drop_high_cardinality, batch]
+      exporters: [prometheusremotewrite]
+
+    # Traces: forward to gateway for tail-based sampling
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, k8sattributes, resource, batch]
+      exporters: [otlp/gateway]
+
+    # Logs: to Loki with label enrichment
+    logs:
+      receivers: [otlp, fluentforward]
+      processors: [memory_limiter, k8sattributes, resource, filter/log_severity, transform/log_labels, batch]
+      exporters: [loki]
+
+  telemetry:
+    logs:
+      level: warn
+      output_paths: [stdout]
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888

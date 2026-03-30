@@ -1,0 +1,118 @@
+# Prometheus recording rules — pre-aggregate frequently-queried metrics
+# to reduce query time and support SLO computation at scale.
+#
+# All rules follow naming convention:
+#   {scope}:{metric_name}:{aggregation_function}
+
+groups:
+  ###########################################################################
+  # Event Ingestion Service — core throughput and error metrics
+  ###########################################################################
+  - name: event_ingestion_recording_rules
+    interval: 30s
+    rules:
+      # Total throughput rate by region and service
+      - record: job:event_ingestion_processed:rate5m
+        expr: |
+          sum by (region, service, status) (
+            rate(event_ingestion_processed_total[5m])
+          )
+
+      - record: job:event_ingestion_processed:rate1h
+        expr: |
+          sum by (region, service) (
+            rate(event_ingestion_processed_total[1h])
+          )
+
+      # Kafka publish success rate
+      - record: job:event_ingestion_kafka_publish:success_rate5m
+        expr: |
+          sum(rate(event_ingestion_kafka_publish_total{status="success"}[5m]))
+          /
+          sum(rate(event_ingestion_kafka_publish_total[5m]))
+
+      # P50/P95/P99 latency aggregates (saves query time vs. histogram_quantile on raw)
+      - record: job:event_ingestion_duration:p50_5m
+        expr: |
+          histogram_quantile(0.50,
+            sum by (le, region) (
+              rate(event_ingestion_processing_duration_seconds_bucket[5m])
+            )
+          )
+
+      - record: job:event_ingestion_duration:p95_5m
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, region) (
+              rate(event_ingestion_processing_duration_seconds_bucket[5m])
+            )
+          )
+
+      - record: job:event_ingestion_duration:p99_5m
+        expr: |
+          histogram_quantile(0.99,
+            sum by (le, region) (
+              rate(event_ingestion_processing_duration_seconds_bucket[5m])
+            )
+          )
+
+  ###########################################################################
+  # Kubernetes cluster health — reduce cardinality from kube-state-metrics
+  ###########################################################################
+  - name: kubernetes_cluster_recording_rules
+    interval: 60s
+    rules:
+      # Pod readiness by namespace
+      - record: namespace:pod_ready:ratio
+        expr: |
+          sum by (namespace) (kube_pod_status_ready{condition="true"})
+          /
+          sum by (namespace) (kube_pod_status_ready)
+
+      # Container restart rate by namespace (for anomaly detection)
+      - record: namespace:container_restarts:rate15m
+        expr: |
+          sum by (namespace) (
+            increase(kube_pod_container_status_restarts_total[15m])
+          )
+
+      # Node CPU utilisation
+      - record: node:cpu_utilisation:rate5m
+        expr: |
+          1 - avg by (node) (
+            rate(node_cpu_seconds_total{mode="idle"}[5m])
+          )
+
+      # Node memory utilisation
+      - record: node:memory_utilisation:ratio
+        expr: |
+          1 - (
+            node_memory_MemAvailable_bytes
+            /
+            node_memory_MemTotal_bytes
+          )
+
+      # Node disk I/O saturation
+      - record: node:disk_io_saturation:rate5m
+        expr: |
+          rate(node_disk_io_time_weighted_seconds_total[5m])
+
+  ###########################################################################
+  # Kafka health — event pipeline lag and throughput
+  ###########################################################################
+  - name: kafka_recording_rules
+    interval: 30s
+    rules:
+      # Consumer group lag — total events behind per topic
+      - record: kafka:consumer_group_lag:sum
+        expr: |
+          sum by (topic, consumer_group) (
+            kafka_consumergroup_lag
+          )
+
+      # Kafka produce rate per topic
+      - record: kafka:produce_rate:rate5m
+        expr: |
+          sum by (topic) (
+            rate(kafka_server_brokertopicmetrics_messagesin_total[5m])
+          )

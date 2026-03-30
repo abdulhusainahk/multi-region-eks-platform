@@ -1,0 +1,111 @@
+{{/*
+Argo Rollouts AnalysisTemplate — defines the Prometheus queries used to
+automatically validate canary health during each rollout step.
+
+Rollback is triggered automatically if ANY metric fails:
+  - error_rate: > 1% of requests return 5xx
+  - p99_latency: > 500ms for 99th percentile of requests
+  - success_rate: < 99% (inverse check for belt-and-suspenders)
+
+The analysis runs continuously during canary steps 1 and 3 (at 10% and 50%).
+If it fails, Argo Rollouts immediately aborts and routes 100% traffic to stable.
+*/}}
+{{- if .Values.rollout.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: {{ include "microservice.fullname" . }}-canary-analysis
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "microservice.labels" . | nindent 4 }}
+spec:
+  args:
+    - name: service-name
+    - name: namespace
+  metrics:
+    # -----------------------------------------------------------------------
+    # Metric 1: Error Rate — must stay below 1%
+    # Query: ratio of 5xx responses vs total requests for the canary pod subset
+    # Interval: evaluated every 60s during the analysis period
+    # FailureLimit: 2 — allows 2 bad samples before aborting (avoids flapping)
+    # -----------------------------------------------------------------------
+    - name: error-rate
+      interval: 60s
+      failureLimit: 2
+      successCondition: result[0] < 0.01
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(
+              rate(
+                http_requests_total{
+                  service="{{ `{{args.service-name}}` }}-canary",
+                  namespace="{{ `{{args.namespace}}` }}",
+                  status_code=~"5.."
+                }[2m]
+              )
+            )
+            /
+            sum(
+              rate(
+                http_requests_total{
+                  service="{{ `{{args.service-name}}` }}-canary",
+                  namespace="{{ `{{args.namespace}}` }}"
+                }[2m]
+              )
+            )
+
+    # -----------------------------------------------------------------------
+    # Metric 2: p99 Latency — must stay below 500ms
+    # -----------------------------------------------------------------------
+    - name: p99-latency
+      interval: 60s
+      failureLimit: 2
+      successCondition: result[0] < 0.5
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            histogram_quantile(
+              0.99,
+              sum(
+                rate(
+                  http_request_duration_seconds_bucket{
+                    service="{{ `{{args.service-name}}` }}-canary",
+                    namespace="{{ `{{args.namespace}}` }}"
+                  }[2m]
+                )
+              ) by (le)
+            )
+
+    # -----------------------------------------------------------------------
+    # Metric 3: Success Rate (belt-and-suspenders) — must stay above 99%
+    # -----------------------------------------------------------------------
+    - name: success-rate
+      interval: 60s
+      failureLimit: 2
+      successCondition: result[0] > 0.99
+      provider:
+        prometheus:
+          address: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          query: |
+            sum(
+              rate(
+                http_requests_total{
+                  service="{{ `{{args.service-name}}` }}-canary",
+                  namespace="{{ `{{args.namespace}}` }}",
+                  status_code=~"2.."
+                }[2m]
+              )
+            )
+            /
+            sum(
+              rate(
+                http_requests_total{
+                  service="{{ `{{args.service-name}}` }}-canary",
+                  namespace="{{ `{{args.namespace}}` }}"
+                }[2m]
+              )
+            )
+{{- end }}

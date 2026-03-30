@@ -1,0 +1,125 @@
+{{/*
+Argo Rollout for production canary deployments.
+Used when rollout.enabled=true (production environments).
+Replaces the standard Deployment resource — Argo Rollouts controller manages pods.
+
+Canary strategy: 10% → 50% → 100%
+  - Step 1: Route 10% of traffic to canary pods
+  - Step 2: Automated Prometheus analysis (error rate + latency)
+  - Step 3: Route 50% if analysis passes
+  - Step 4: 5-minute bake time at 50%
+  - Step 5: Full rollout to 100%
+  - Auto-rollback: triggered if error rate > 1% or p99 latency > 500ms
+
+The companion AnalysisTemplate (analysis-template.yaml) defines the Prometheus
+queries used to validate canary health at each step.
+*/}}
+{{- if .Values.rollout.enabled }}
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: {{ include "microservice.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "microservice.labels" . | nindent 4 }}
+  annotations:
+    # Link to the deployment that triggered this rollout (for audit trail)
+    deploy/commit: {{ .Values.image.tag | quote }}
+    deploy/pipeline: "github-actions"
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "microservice.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "microservice.selectorLabels" . | nindent 8 }}
+      annotations:
+        {{- toYaml .Values.podAnnotations | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "microservice.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          env:
+            - name: ENVIRONMENT
+              value: {{ .Values.environment | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- range .Values.secretEnv }}
+            - name: {{ .name }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .secretName }}
+                  key: {{ .key }}
+            {{- end }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          startupProbe:
+            {{- toYaml .Values.startupProbe | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # Writable /tmp for services that need temporary file storage
+        # (required because containerSecurityContext.readOnlyRootFilesystem=true)
+        - name: tmp
+          emptyDir: {}
+  strategy:
+    canary:
+      # Service names: Argo Rollouts manages two services (stable + canary)
+      # to split traffic between the existing (stable) and new (canary) pods.
+      stableService: {{ include "microservice.fullname" . }}-stable
+      canaryService: {{ include "microservice.fullname" . }}-canary
+      # Traffic routing via NGINX ingress (weight-based splitting)
+      trafficRouting:
+        nginx:
+          stableIngress: {{ include "microservice.fullname" . }}
+      steps:
+        {{- toYaml .Values.rollout.canary.steps | nindent 8 }}
+      analysis:
+        {{- toYaml .Values.rollout.canary.analysis | nindent 8 }}
+      # Anti-affinity: don't place canary pods on same nodes as stable pods
+      antiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution: {}
+        weight: 1
+{{- end }}

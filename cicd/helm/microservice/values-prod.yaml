@@ -1,0 +1,76 @@
+# Production-specific overrides
+# Canary rollout enabled — Argo Rollouts manages the 10% → 50% → 100% progression.
+environment: production
+replicaCount: 8
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    memory: 4Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 8
+  maxReplicas: 50
+
+# Canary rollout via Argo Rollouts — replaces standard Deployment
+rollout:
+  enabled: true
+  canary:
+    steps:
+      - setWeight: 10
+      - pause: {}           # Waits for analysisRun pass (Prometheus checks)
+      - setWeight: 50
+      - pause:
+          duration: 5m
+      - setWeight: 100
+    analysis:
+      templates:
+        - templateName: event-ingestion-canary-analysis
+      args:
+        - name: service-name
+          value: "{{ .Release.Name }}"
+        - name: namespace
+          value: "{{ .Release.Namespace }}"
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/canary: "false"  # Managed by Argo Rollouts
+  hosts:
+    - host: app.clevertap.com
+      paths:
+        - path: /api
+          pathType: Prefix
+
+externalSecrets:
+  enabled: true
+  secretStoreName: aws-secrets-manager
+  refreshInterval: 1h
+  data:
+    - secretKey: kafka-bootstrap-servers
+      remoteRef:
+        key: /clevertap/prod/event-ingestion/kafka-bootstrap-servers
+    - secretKey: redis-url
+      remoteRef:
+        key: /clevertap/prod/event-ingestion/redis-url
+    - secretKey: db-password
+      remoteRef:
+        key: /clevertap/prod/event-ingestion/db-password
+
+serviceAccount:
+  create: true
+  irsaRoleArn: ""  # Set via Terraform output in CI
+
+nodeSelector:
+  role: event-processing
+  environment: production
+
+# Stricter PDB for production — never go below 50% of replicas
+podDisruptionBudget:
+  enabled: true
+  minAvailable: "50%"

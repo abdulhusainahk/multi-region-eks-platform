@@ -1,0 +1,355 @@
+{
+  "uid": "event-ingestion",
+  "title": "Event Ingestion — Service Overview",
+  "description": "SLO-based dashboard for the event-ingestion service. Shows error budget burn rates, throughput, latency, and Kafka durability.",
+  "tags": ["slo", "event-ingestion", "sre"],
+  "timezone": "UTC",
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "version": 1,
+  "time": { "from": "now-3h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "region",
+        "type": "query",
+        "query": "label_values(event_ingestion_processed_total, region)",
+        "current": { "value": "$__all", "text": "All" },
+        "multi": true,
+        "includeAll": true,
+        "label": "Region"
+      },
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "pluginId": "prometheus",
+        "current": { "value": "Thanos", "text": "Thanos" },
+        "label": "Datasource"
+      }
+    ]
+  },
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "type": "tags",
+        "datasource": { "type": "grafana", "uid": "grafana" },
+        "enable": true,
+        "iconColor": "blue",
+        "tags": ["deployment", "event-ingestion"],
+        "showIn": 0
+      },
+      {
+        "name": "Incidents",
+        "type": "tags",
+        "datasource": { "type": "grafana", "uid": "grafana" },
+        "enable": true,
+        "iconColor": "red",
+        "tags": ["incident"]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Availability Error Budget Remaining (28d)",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.1 },
+              { "color": "yellow", "value": 0.25 },
+              { "color": "green", "value": 0.5 }
+            ]
+          },
+          "mappings": []
+        }
+      },
+      "targets": [
+        {
+          "expr": "job:event_ingestion_availability:error_budget_remaining",
+          "legendFormat": "Error Budget Remaining",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Current Error Rate (1h)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.001 },
+              { "color": "orange", "value": 0.005 },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "job:event_ingestion_errors:ratio_rate1h",
+          "legendFormat": "1h Error Rate",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Throughput (events/sec)",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 400000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum(job:event_ingestion_processed:rate5m{region=~\"$region\"})",
+          "legendFormat": "Events/sec",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Kafka Publish Success Rate",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.999 },
+              { "color": "green", "value": 0.9999 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "job:event_ingestion_kafka_publish:success_rate5m",
+          "legendFormat": "Kafka Success Rate",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Error Budget Burn Rate (multi-window)",
+      "description": "Alert fires when 1h burn rate > 14.4 (P1) or 6h > 6 (P2). A rate of 1.0 means consuming budget at exactly the sustainable pace.",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "options": {
+        "tooltip": { "mode": "multi" }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": { "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "P1 threshold (14.4x)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "P2 threshold (6x)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [8, 4] } }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "job:event_ingestion_errors:ratio_rate1h / 0.001",
+          "legendFormat": "1h burn rate",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "job:event_ingestion_errors:ratio_rate6h / 0.001",
+          "legendFormat": "6h burn rate",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "vector(14.4)",
+          "legendFormat": "P1 threshold (14.4x)",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "vector(6)",
+          "legendFormat": "P2 threshold (6x)",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Event Processing Throughput by Region",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "lineWidth": 2 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (region) (job:event_ingestion_processed:rate5m{region=~\"$region\", status=\"success\"})",
+          "legendFormat": "{{ region }} — success",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "sum by (region) (job:event_ingestion_processed:rate5m{region=~\"$region\", status=\"error\"})",
+          "legendFormat": "{{ region }} — error",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Processing Latency Percentiles (p50/p95/p99)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "SLO target (500ms)" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash" } }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "expr": "job:event_ingestion_duration:p50_5m",
+          "legendFormat": "p50",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "job:event_ingestion_duration:p95_5m",
+          "legendFormat": "p95",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "job:event_ingestion_duration:p99_5m",
+          "legendFormat": "p99",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        },
+        {
+          "expr": "vector(0.5)",
+          "legendFormat": "SLO target (500ms)",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Kafka Consumer Lag — campaign-events topic",
+      "description": "Consumer lag indicates how far behind consumers are from producers. Sustained lag > 10k means downstream processing is not keeping up.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5000 },
+              { "color": "red", "value": 10000 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "expr": "kafka:consumer_group_lag:sum{topic=\"campaign-events\"}",
+          "legendFormat": "{{ consumer_group }}",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Pod Restart Count (event-ingestion namespace)",
+      "description": "Sudden spike indicates crash looping. Correlate with deployment annotations.",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 2 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "custom": { "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (pod) (increase(kube_pod_container_status_restarts_total{namespace=\"production\", service=\"event-ingestion\"}[15m]))",
+          "legendFormat": "{{ pod }}",
+          "datasource": { "type": "prometheus", "uid": "$datasource" }
+        }
+      ]
+    }
+  ]
+}

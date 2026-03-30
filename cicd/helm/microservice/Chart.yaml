@@ -1,0 +1,15 @@
+apiVersion: v2
+name: microservice
+description: Generic Helm chart for CleverTap containerized microservices on EKS.
+  Supports both standard Deployments and Argo Rollouts canary deployments.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - clevertap
+  - microservice
+  - eks
+home: https://github.com/clevertap/infra
+maintainers:
+  - name: platform-sre
+    email: sre@clevertap.com

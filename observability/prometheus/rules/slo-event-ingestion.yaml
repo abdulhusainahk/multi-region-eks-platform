@@ -1,0 +1,336 @@
+# SLO-based alerting rules for the event-ingestion service
+#
+# Implements Google SRE multi-window, multi-burn-rate alerting:
+#   https://sre.google/workbook/alerting-on-slos/
+#
+# SLOs:
+#   - Availability: 99.9% of events successfully processed (error budget: 43.2 min/28d)
+#   - Latency p99:  99.5% of events processed in < 500ms (error budget: 3.36h/28d)
+#   - Durability:   99.99% of events published to Kafka (error budget: 4.32 min/28d)
+#
+# Burn rate windows and thresholds:
+#   - 1h  window, burn > 14.4x  →  CRITICAL PAGE  (2% budget consumed in 1h)
+#   - 6h  window, burn > 6x     →  WARNING TICKET  (5% budget consumed in 6h)
+#   - 3d  window, burn > 1x     →  INFO (trending toward exhaustion)
+
+groups:
+  ###########################################################################
+  # Recording Rules — pre-aggregate error ratios for fast burn-rate queries
+  ###########################################################################
+  - name: slo_event_ingestion_recording
+    interval: 30s
+    rules:
+      # --- Availability ---
+      # Error ratio: proportion of failed event processing operations
+      - record: job:event_ingestion_errors:ratio_rate1m
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[1m]))
+          /
+          sum(rate(event_ingestion_processed_total[1m]))
+
+      - record: job:event_ingestion_errors:ratio_rate5m
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[5m]))
+          /
+          sum(rate(event_ingestion_processed_total[5m]))
+
+      - record: job:event_ingestion_errors:ratio_rate30m
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[30m]))
+          /
+          sum(rate(event_ingestion_processed_total[30m]))
+
+      - record: job:event_ingestion_errors:ratio_rate1h
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[1h]))
+          /
+          sum(rate(event_ingestion_processed_total[1h]))
+
+      - record: job:event_ingestion_errors:ratio_rate6h
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[6h]))
+          /
+          sum(rate(event_ingestion_processed_total[6h]))
+
+      - record: job:event_ingestion_errors:ratio_rate3d
+        expr: |
+          sum(rate(event_ingestion_processed_total{status="error"}[3d]))
+          /
+          sum(rate(event_ingestion_processed_total[3d]))
+
+      # --- Latency (p99 > 500ms = error) ---
+      - record: job:event_ingestion_latency_errors:ratio_rate5m
+        expr: |
+          1 - (
+            sum(rate(event_ingestion_processing_duration_seconds_bucket{le="0.5"}[5m]))
+            /
+            sum(rate(event_ingestion_processing_duration_seconds_count[5m]))
+          )
+
+      - record: job:event_ingestion_latency_errors:ratio_rate30m
+        expr: |
+          1 - (
+            sum(rate(event_ingestion_processing_duration_seconds_bucket{le="0.5"}[30m]))
+            /
+            sum(rate(event_ingestion_processing_duration_seconds_count[30m]))
+          )
+
+      - record: job:event_ingestion_latency_errors:ratio_rate1h
+        expr: |
+          1 - (
+            sum(rate(event_ingestion_processing_duration_seconds_bucket{le="0.5"}[1h]))
+            /
+            sum(rate(event_ingestion_processing_duration_seconds_count[1h]))
+          )
+
+      - record: job:event_ingestion_latency_errors:ratio_rate6h
+        expr: |
+          1 - (
+            sum(rate(event_ingestion_processing_duration_seconds_bucket{le="0.5"}[6h]))
+            /
+            sum(rate(event_ingestion_processing_duration_seconds_count[6h]))
+          )
+
+      # --- Kafka Durability ---
+      - record: job:event_ingestion_kafka_errors:ratio_rate5m
+        expr: |
+          sum(rate(event_ingestion_kafka_publish_total{status="error"}[5m]))
+          /
+          sum(rate(event_ingestion_kafka_publish_total[5m]))
+
+      - record: job:event_ingestion_kafka_errors:ratio_rate1h
+        expr: |
+          sum(rate(event_ingestion_kafka_publish_total{status="error"}[1h]))
+          /
+          sum(rate(event_ingestion_kafka_publish_total[1h]))
+
+      # --- Error budget remaining (28-day rolling) ---
+      - record: job:event_ingestion_availability:error_budget_remaining
+        expr: |
+          1 - (
+            sum(increase(event_ingestion_processed_total{status="error"}[28d]))
+            /
+            (sum(increase(event_ingestion_processed_total[28d])) * (1 - 0.999))
+          )
+
+      - record: job:event_ingestion_latency:error_budget_remaining
+        expr: |
+          1 - (
+            sum(increase(event_ingestion_processing_duration_seconds_count{quantile!=""}[28d]))
+            * (job:event_ingestion_latency_errors:ratio_rate6h)
+            /
+            (sum(increase(event_ingestion_processing_duration_seconds_count[28d])) * (1 - 0.995))
+          )
+
+  ###########################################################################
+  # Alert Rules — Availability SLO (99.9%)
+  # error_budget_fraction = 1 - SLO = 0.001
+  ###########################################################################
+  - name: slo_event_ingestion_availability_alerts
+    rules:
+      # -----------------------------------------------------------------------
+      # P1 — Critical: 2% of monthly error budget consumed in 1 hour
+      # burn_rate = 14.4 means 14.4× faster than the sustainable rate
+      # Multi-window: both 1h AND 5m must exceed threshold (reduces false positives)
+      # -----------------------------------------------------------------------
+      - alert: EventIngestionAvailabilitySLOCritical
+        expr: |
+          (
+            job:event_ingestion_errors:ratio_rate1h > (14.4 * 0.001)
+            and
+            job:event_ingestion_errors:ratio_rate5m > (14.4 * 0.001)
+          )
+        for: 2m
+        labels:
+          severity: critical
+          service: event-ingestion
+          slo: availability
+          burn_rate_window: 1h
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion availability SLO critical burn rate"
+          description: >
+            Event ingestion error rate is {{ $value | humanizePercentage }} over the last hour.
+            At this burn rate, the 28-day error budget will be exhausted in
+            {{ printf "%.1f" (div 1.0 (div $value 0.001)) }} hours.
+            Current budget remaining: {{ query "job:event_ingestion_availability:error_budget_remaining" | first | value | humanizePercentage }}.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+          dashboard_url: "https://grafana.clevertap.com/d/event-ingestion/event-ingestion-overview"
+
+      # -----------------------------------------------------------------------
+      # P2 — Warning: 5% of monthly error budget consumed in 6 hours
+      # burn_rate = 6 means 6× faster than the sustainable rate
+      # -----------------------------------------------------------------------
+      - alert: EventIngestionAvailabilitySLOWarning
+        expr: |
+          (
+            job:event_ingestion_errors:ratio_rate6h > (6 * 0.001)
+            and
+            job:event_ingestion_errors:ratio_rate30m > (6 * 0.001)
+          )
+        for: 15m
+        labels:
+          severity: warning
+          service: event-ingestion
+          slo: availability
+          burn_rate_window: 6h
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion availability SLO warning burn rate"
+          description: >
+            Event ingestion error rate is {{ $value | humanizePercentage }} sustained over 6 hours.
+            The 28-day error budget will be exhausted in
+            {{ printf "%.1f" (div 168.0 (div $value 0.001)) }} hours if this continues.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+          dashboard_url: "https://grafana.clevertap.com/d/event-ingestion/event-ingestion-overview"
+
+      # -----------------------------------------------------------------------
+      # P3 — Info: Trending toward exhaustion (burn rate ≥ 1x for 3 days)
+      # -----------------------------------------------------------------------
+      - alert: EventIngestionAvailabilitySLOBudgetLow
+        expr: job:event_ingestion_errors:ratio_rate3d > (1 * 0.001)
+        for: 1h
+        labels:
+          severity: info
+          service: event-ingestion
+          slo: availability
+          burn_rate_window: 3d
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion availability SLO error budget trending low"
+          description: >
+            At current error rate ({{ $value | humanizePercentage }}), the 28-day error
+            budget will be exhausted before the next SLO reset period.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/docs/alert-noise-reduction.md"
+
+  ###########################################################################
+  # Alert Rules — Latency SLO (99.5% of events processed in < 500ms)
+  # error_budget_fraction = 1 - SLO = 0.005
+  ###########################################################################
+  - name: slo_event_ingestion_latency_alerts
+    rules:
+      - alert: EventIngestionLatencySLOCritical
+        expr: |
+          (
+            job:event_ingestion_latency_errors:ratio_rate1h > (14.4 * 0.005)
+            and
+            job:event_ingestion_latency_errors:ratio_rate5m > (14.4 * 0.005)
+          )
+        for: 2m
+        labels:
+          severity: critical
+          service: event-ingestion
+          slo: latency
+          burn_rate_window: 1h
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion latency SLO critical burn rate"
+          description: >
+            {{ $value | humanizePercentage }} of event ingestion requests are exceeding
+            500ms p99 latency threshold over the last hour.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+
+      - alert: EventIngestionLatencySLOWarning
+        expr: |
+          (
+            job:event_ingestion_latency_errors:ratio_rate6h > (6 * 0.005)
+            and
+            job:event_ingestion_latency_errors:ratio_rate30m > (6 * 0.005)
+          )
+        for: 15m
+        labels:
+          severity: warning
+          service: event-ingestion
+          slo: latency
+          burn_rate_window: 6h
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion latency SLO warning burn rate"
+          description: >
+            Sustained latency degradation: {{ $value | humanizePercentage }} of requests
+            exceeding 500ms over 6 hours.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+
+  ###########################################################################
+  # Alert Rules — Kafka Durability SLO (99.99%)
+  # error_budget_fraction = 1 - SLO = 0.0001
+  ###########################################################################
+  - name: slo_event_ingestion_durability_alerts
+    rules:
+      - alert: EventIngestionKafkaDurabilitySLOCritical
+        expr: |
+          (
+            job:event_ingestion_kafka_errors:ratio_rate1h > (14.4 * 0.0001)
+            and
+            job:event_ingestion_kafka_errors:ratio_rate5m > (14.4 * 0.0001)
+          )
+        for: 1m
+        labels:
+          severity: critical
+          service: event-ingestion
+          slo: kafka-durability
+          burn_rate_window: 1h
+          team: platform-sre
+        annotations:
+          summary: "Event ingestion Kafka durability SLO critical — data loss risk"
+          description: >
+            {{ $value | humanizePercentage }} of events are FAILING to publish to Kafka.
+            This is a DATA LOSS incident. Immediate escalation required.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+          pagerduty_incident_key: "kafka-durability-{{ $labels.region }}"
+
+  ###########################################################################
+  # Pod-level alerts (supporting the crash loop runbook)
+  # These use traditional thresholds but with tight for: durations to
+  # avoid noise from transient container restarts
+  ###########################################################################
+  - name: kubernetes_pod_alerts
+    rules:
+      - alert: KubePodCrashLooping
+        expr: |
+          increase(kube_pod_container_status_restarts_total{
+            namespace=~"production|staging",
+            container!="istio-proxy"
+          }[15m]) > 3
+        for: 5m
+        labels:
+          severity: critical
+          team: platform-sre
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash looping"
+          description: >
+            Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }}
+            has restarted {{ $value }} times in the last 15 minutes.
+            This may be causing SLO burn rate degradation.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+          dashboard_url: "https://grafana.clevertap.com/d/kubernetes-pods/kubernetes-pods"
+
+      - alert: KubePodNotReady
+        expr: |
+          kube_pod_status_ready{condition="false", namespace=~"production|staging"} == 1
+        for: 10m
+        labels:
+          severity: warning
+          team: platform-sre
+        annotations:
+          summary: "Pod {{ $labels.pod }} not ready for 10+ minutes"
+          description: >
+            Pod {{ $labels.namespace }}/{{ $labels.pod }} has been in not-ready state
+            for more than 10 minutes.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"
+
+      - alert: KubeDeploymentReplicasMismatch
+        expr: |
+          kube_deployment_spec_replicas{namespace=~"production|staging"}
+          !=
+          kube_deployment_status_available_replicas{namespace=~"production|staging"}
+        for: 15m
+        labels:
+          severity: warning
+          team: platform-sre
+        annotations:
+          summary: "Deployment {{ $labels.deployment }} replica count mismatch"
+          description: >
+            Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has
+            {{ $value }} fewer available replicas than desired for 15+ minutes.
+          runbook_url: "https://github.com/clevertap/infra/blob/main/runbooks/pod-crash-looping.md"

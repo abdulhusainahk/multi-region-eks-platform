@@ -1,0 +1,52 @@
+# Staging-specific overrides
+# Merged with values.yaml at deploy time: helm upgrade ... --values values-staging.yaml
+environment: staging
+replicaCount: 2
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 6
+
+# Rollout disabled for staging — use standard Deployment for simpler debugging
+rollout:
+  enabled: false
+
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+  hosts:
+    - host: staging.clevertap.com
+      paths:
+        - path: /api
+          pathType: Prefix
+
+externalSecrets:
+  enabled: true
+  secretStoreName: aws-secrets-manager
+  refreshInterval: 15m
+  data:
+    - secretKey: kafka-bootstrap-servers
+      remoteRef:
+        key: /clevertap/staging/event-ingestion/kafka-bootstrap-servers
+    - secretKey: redis-url
+      remoteRef:
+        key: /clevertap/staging/event-ingestion/redis-url
+
+serviceAccount:
+  create: true
+  # IRSA role for staging — allows read access to staging Secrets Manager paths
+  irsaRoleArn: ""  # Set via Terraform output in CI: --set serviceAccount.irsaRoleArn=...
+
+nodeSelector:
+  role: event-processing
+  environment: staging

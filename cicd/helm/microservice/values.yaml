@@ -1,0 +1,207 @@
+# Default values for the generic microservice chart.
+# Override per-environment via values-staging.yaml / values-prod.yaml,
+# or at deploy time with --set flags in the GitHub Actions workflow.
+#
+# IMPORTANT: No secrets in this file. All secrets are injected at runtime
+# via External Secrets Operator pulling from AWS Secrets Manager.
+# See: templates/external-secret.yaml
+
+# -- Service identity
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Container image (tag overridden at deploy time with commit SHA)
+image:
+  repository: ""  # Required: set via --set in CI/CD, e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com/event-ingestion
+  tag: ""         # Required: set via --set image.tag=${{ github.sha }} in CI/CD
+  pullPolicy: IfNotPresent
+
+# -- Environment name (dev | staging | production)
+environment: staging
+
+# -- Replica count (ignored when rollout.enabled=true — Argo Rollouts manages replicas)
+replicaCount: 2
+
+# -- Argo Rollouts canary configuration
+# Set rollout.enabled=true for production deployments.
+# Set rollout.enabled=false for staging (uses standard Deployment).
+rollout:
+  enabled: false
+  canary:
+    # Traffic steps: 10% → 50% → 100%
+    # Each step has automated analysis before progressing.
+    steps:
+      - setWeight: 10
+      - pause: {}           # Automated analysis gate: waits for analysisRun to pass
+      - setWeight: 50
+      - pause:
+          duration: 5m      # 5-minute bake time at 50% before full rollout
+      - setWeight: 100
+    # Automated rollback triggers (Prometheus queries, evaluated during canary)
+    analysis:
+      templates:
+        - templateName: event-ingestion-canary-analysis
+      args:
+        - name: service-name
+          value: "{{ .Release.Name }}"
+        - name: namespace
+          value: "{{ .Release.Namespace }}"
+
+# -- Resource requests and limits
+# Always set both requests AND limits to enable VPA recommendations and
+# prevent noisy-neighbour issues on shared nodes.
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    # No CPU limit (CPU throttling causes latency spikes; use requests for scheduling)
+    memory: 1Gi
+
+# -- Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  # Scale down slowly to avoid thrashing (2 pods per 5 minutes)
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 300
+
+# -- Pod Disruption Budget — ensures rolling updates never take all pods down
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# -- Kubernetes Service
+service:
+  type: ClusterIP
+  port: 8080
+  targetPort: 8080
+
+# -- Ingress (disabled by default; configured per-environment)
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+  hosts: []
+  tls: []
+
+# -- Health checks — MUST be configured per-service; these are safe defaults
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+  timeoutSeconds: 3
+
+startupProbe:
+  httpGet:
+    path: /health/live
+    port: 8080
+  failureThreshold: 30
+  periodSeconds: 10
+
+# -- Environment variables injected into the container
+# NEVER put secrets here. Use secretEnv for values from ExternalSecret.
+env: []
+# - name: LOG_LEVEL
+#   value: "info"
+
+# -- Environment variables sourced from Kubernetes secrets (created by ExternalSecret)
+secretEnv: []
+# - name: DATABASE_PASSWORD
+#   secretName: "{{ .Release.Name }}-secrets"
+#   key: database-password
+
+# -- AWS Secrets Manager integration via External Secrets Operator
+# Secrets defined here are synced from AWS Secrets Manager into Kubernetes secrets.
+# They are then mounted as environment variables (via secretEnv above) or volume mounts.
+externalSecrets:
+  enabled: true
+  # The ClusterSecretStore name — provisioned by the platform team via Terraform
+  secretStoreName: aws-secrets-manager
+  # Refresh interval for secret rotation
+  refreshInterval: 1h
+  # List of secrets to pull from AWS Secrets Manager
+  data: []
+  # - secretKey: database-password        # key in the Kubernetes secret
+  #   remoteRef:
+  #     key: /clevertap/staging/event-ingestion/db-password  # path in Secrets Manager
+
+# -- ServiceAccount with IRSA annotation for pod-level AWS API access
+serviceAccount:
+  create: true
+  # IRSA role ARN — injected via values-<env>.yaml (never hardcoded here)
+  irsaRoleArn: ""
+  annotations: {}
+
+# -- Security context — enforce least privilege
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# -- Topology spread for multi-AZ distribution
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: DoNotSchedule
+    labelSelector:
+      matchLabels:
+        app: "{{ .Release.Name }}"
+
+# -- Node selector and tolerations
+nodeSelector:
+  role: event-processing
+
+tolerations: []
+
+affinity:
+  # Prefer not to co-locate replicas on the same node
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app: "{{ .Release.Name }}"
+
+# -- Prometheus scraping annotations
+metrics:
+  enabled: true
+  path: /metrics
+  port: 8080
+
+# -- Pod annotations
+podAnnotations:
+  prometheus.io/scrape: "true"
+  prometheus.io/path: /metrics
+  prometheus.io/port: "8080"
