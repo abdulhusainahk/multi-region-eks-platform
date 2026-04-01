@@ -1,4 +1,4 @@
-# CleverTap Infrastructure — Staff DevOps Engineer Technical Assessment
+# Multi Region Cloud Platform
 
 > **Role**: Staff DevOps Engineer  
 > **Assessment Sections**: Infrastructure Architecture & IaC (Section 1)
